@@ -4,17 +4,21 @@
 #import <stdio.h>
 #import <stdarg.h>
 #import <time.h>
+#import <stdlib.h>
 
 @protocol NetflixPlayerAccessInfo;
 @protocol NetflixPlayerAccessEvent;
 @protocol NSError;
+
+// ========== FORWARD DECLARATIONS ==========
+static void install_hooks(Class sdkClass);
+static Class find_netflix_sdk_class(void);
 
 // ========== FILE LOGGING ==========
 static inline void bypass_log(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
 
-    // Get Documents directory
     @autoreleasepool {
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         if (paths.count > 0) {
@@ -23,14 +27,11 @@ static inline void bypass_log(const char *fmt, ...) {
 
             FILE *f = fopen([logPath UTF8String], "a");
             if (f) {
-                // Timestamp
                 time_t now = time(NULL);
                 struct tm *tm_info = localtime(&now);
                 char timestamp[32];
                 strftime(timestamp, sizeof(timestamp), "%H:%M:%S", tm_info);
                 fprintf(f, "[%s] ", timestamp);
-
-                // Message
                 vfprintf(f, fmt, args);
                 fprintf(f, "\n");
                 fclose(f);
@@ -40,7 +41,6 @@ static inline void bypass_log(const char *fmt, ...) {
     va_end(args);
 }
 
-// Also log to stderr (visible in Xcode Console / idevicesyslog)
 #define BYPASS_LOG(fmt, ...) do { \
     bypass_log(fmt, ##__VA_ARGS__); \
     fprintf(stderr, "[BYPASS] " fmt "\n", ##__VA_ARGS__); \
@@ -91,9 +91,8 @@ static void hooked_onPlayerAccessChange(id self, SEL _cmd, id event) {
     BYPASS_LOG("onPlayerAccessChangeWithAccessEvent: called - event: %p", event);
 }
 
-// ========== CLASS FINDER WITH LOGGING ==========
-static Class find_netflix_sdk_class() {
-    // Try known mangled names
+// ========== CLASS FINDER ==========
+static Class find_netflix_sdk_class(void) {
     const char *candidates[] = {
         "_TtC12NetflixGames15NetflixGamesSDK",
         "_TtC12NetflixGames14NetflixGamesSDK",
@@ -112,9 +111,8 @@ static Class find_netflix_sdk_class() {
         }
     }
 
-    // Enumerate all classes as fallback
     int count = objc_getClassList(NULL, 0);
-    Class *classes = malloc(count * sizeof(Class));
+    Class *classes = (Class *)malloc(count * sizeof(Class));
     count = objc_getClassList(classes, count);
 
     for (int i = 0; i < count; i++) {
@@ -130,46 +128,10 @@ static Class find_netflix_sdk_class() {
     return nil;
 }
 
-// ========== CONSTRUCTOR ==========
-__attribute__((constructor(101))) // Run early (lower = earlier)
-static void bypass_init() {
-    BYPASS_LOG("=== bypass.dylib LOADED ===");
-
-    // Find class immediately (don't wait)
-    Class sdkClass = find_netflix_sdk_class();
-
-    if (!sdkClass) {
-        BYPASS_LOG("Class not found immediately, will retry in background...");
-    } else {
-        install_hooks(sdkClass);
-    }
-
-    // Background retry if not found
-    if (!sdkClass) {
-        dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-        dispatch_async(queue, ^{
-            int attempts = 0;
-            Class cls = nil;
-            while (!cls && attempts < 200) { // 20 seconds max
-                cls = find_netflix_sdk_class();
-                if (!cls) {
-                    usleep(100000); // 100ms
-                    attempts++;
-                }
-            }
-            if (cls) {
-                install_hooks(cls);
-            } else {
-                BYPASS_LOG("ERROR: NetflixGamesSDK class NOT FOUND after 20 seconds");
-            }
-        });
-    }
-}
-
+// ========== HOOK INSTALLER ==========
 static void install_hooks(Class sdkClass) {
     BYPASS_LOG("Installing hooks on class: %s", class_getName(sdkClass));
 
-    // 1. requestPlayerAccessWithCompletionHandler:
     SEL sel1 = sel_registerName("requestPlayerAccessWithCompletionHandler:");
     Method m1 = class_getInstanceMethod(sdkClass, sel1);
     if (m1) {
@@ -180,7 +142,6 @@ static void install_hooks(Class sdkClass) {
         BYPASS_LOG("NOT FOUND: requestPlayerAccessWithCompletionHandler:");
     }
 
-    // 2. currentProfileAndReturnError:
     SEL sel2 = sel_registerName("currentProfileAndReturnError:");
     Method m2 = class_getInstanceMethod(sdkClass, sel2);
     if (m2) {
@@ -191,7 +152,6 @@ static void install_hooks(Class sdkClass) {
         BYPASS_LOG("NOT FOUND: currentProfileAndReturnError:");
     }
 
-    // 3. onPlayerAccessChangeWithAccessEvent:
     SEL sel3 = sel_registerName("onPlayerAccessChangeWithAccessEvent:");
     Method m3 = class_getInstanceMethod(sdkClass, sel3);
     if (m3) {
@@ -202,12 +162,37 @@ static void install_hooks(Class sdkClass) {
         BYPASS_LOG("NOT FOUND: onPlayerAccessChangeWithAccessEvent:");
     }
 
-    // 4. Also try class methods (some SDKs use +sharedInstance pattern)
-    SEL sel_shared = sel_registerName("sharedInstance");
-    Method m_shared = class_getClassMethod(sdkClass, sel_shared);
-    if (m_shared) {
-        BYPASS_LOG("Found sharedInstance class method");
-    }
-
     BYPASS_LOG("Hook installation complete");
+}
+
+// ========== CONSTRUCTOR ==========
+__attribute__((constructor(101)))
+static void bypass_init(void) {
+    BYPASS_LOG("=== bypass.dylib LOADED ===");
+
+    Class sdkClass = find_netflix_sdk_class();
+
+    if (sdkClass) {
+        install_hooks(sdkClass);
+    } else {
+        BYPASS_LOG("Class not found immediately, will retry in background...");
+
+        dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+        dispatch_async(queue, ^{
+            int attempts = 0;
+            Class cls = nil;
+            while (!cls && attempts < 200) {
+                cls = find_netflix_sdk_class();
+                if (!cls) {
+                    usleep(100000);
+                    attempts++;
+                }
+            }
+            if (cls) {
+                install_hooks(cls);
+            } else {
+                BYPASS_LOG("ERROR: NetflixGamesSDK class NOT FOUND after 20 seconds");
+            }
+        });
+    }
 }
