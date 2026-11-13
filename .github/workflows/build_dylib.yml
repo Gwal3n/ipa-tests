@@ -1,0 +1,49 @@
+name: Build Bypass Dylib
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'bypass.m'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Compile dylib for iOS ARM64
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG=$(xcrun --sdk iphoneos --find clang)
+
+          echo "SDK: $SDK"
+          $CLANG -arch arm64 -isysroot "$SDK" \
+            -dynamiclib \
+            -framework Foundation \
+            -fobjc-arc \
+            -o bypass.dylib \
+            bypass.m \
+            -Wl,-install_name,@rpath/bypass.dylib
+
+          codesign --sign - --force bypass.dylib
+          file bypass.dylib
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bypass-dylib
+          path: bypass.dylib
+          retention-days: 30
+
+      - name: Create release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: nbypass.dylib
